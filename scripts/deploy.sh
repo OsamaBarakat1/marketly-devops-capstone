@@ -228,25 +228,44 @@ fi
 
 step "Reading credentials"
 
-# The signing key shared by auth, catalog and orders. Generated once, on the
-# first deploy, and kept in SSM as a SecureString — never typed by a person,
-# never in this repository, never in Terraform state. All three services
-# read the same value from this one rendering pass, so they cannot drift.
-shared_secret_param="/$PROJECT_PREFIX/app/shared-secret"
-if ! SHARED_SECRET="$(aws ssm get-parameter --region "$AWS_REGION" \
-      --name "$shared_secret_param" --with-decryption \
-      --query Parameter.Value --output text 2>/dev/null)"; then
-  info "generating the shared signing key for the first time"
+# Reads an application secret from SSM, generating and storing it the first
+# time it is needed. Nothing here is ever typed by a person, committed to
+# this repository, or written into Terraform state.
+#
+# The value is returned in SSM_SECRET_VALUE rather than on stdout, so that
+# the progress lines below cannot end up captured as part of a secret.
+ssm_secret() {
+  local name="$1" description="$2" bytes="$3" param
+  param="/$PROJECT_PREFIX/app/$name"
+
+  if SSM_SECRET_VALUE="$(aws ssm get-parameter --region "$AWS_REGION" \
+        --name "$param" --with-decryption \
+        --query Parameter.Value --output text 2>/dev/null)"; then
+    ok "$description read from $param"
+    return
+  fi
+
+  info "generating the $description for the first time"
   command -v openssl >/dev/null 2>&1 ||
-    die "openssl is needed to generate the shared signing key on the first deploy"
-  SHARED_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
+    die "openssl is needed to generate the $description on the first deploy"
+  SSM_SECRET_VALUE="$(openssl rand -base64 "$bytes" | tr -d '\n')"
   aws ssm put-parameter --region "$AWS_REGION" \
-    --name "$shared_secret_param" --type SecureString --value "$SHARED_SECRET" \
-    --description "JWT signing key shared by the Marketly services" >/dev/null
-  ok "stored at $shared_secret_param"
-else
-  ok "signing key read from $shared_secret_param"
-fi
+    --name "$param" --type SecureString --value "$SSM_SECRET_VALUE" \
+    --description "$description for the Marketly services" >/dev/null
+  ok "$description generated and stored at $param"
+}
+
+# The signing key shared by auth, catalog and orders. All three read the same
+# value from this one rendering pass, so they cannot drift.
+ssm_secret shared-secret "JWT signing key" 48
+SHARED_SECRET="$SSM_SECRET_VALUE"
+
+# The initial admin password. Left unset, auth-service seeds its admin user
+# with the default published in its source — on an application the load
+# balancer exposes to the internet.
+ssm_secret admin-seed-password "initial admin password" 24
+ADMIN_SEED_PASSWORD="$SSM_SECRET_VALUE"
+unset SSM_SECRET_VALUE
 
 # RDS generated this password into Secrets Manager and Terraform never saw
 # it, so it is read here, at the moment it is needed.
@@ -271,7 +290,7 @@ DATABASE_URL="postgresql://$db_user:$(python3 -c 'import urllib.parse,sys; print
 unset db_password
 ok "database password read from Secrets Manager"
 
-export ECR_REGISTRY IMAGE_PREFIX IMAGE_TAG APP_ORIGIN SHARED_SECRET DATABASE_URL
+export ECR_REGISTRY IMAGE_PREFIX IMAGE_TAG APP_ORIGIN SHARED_SECRET DATABASE_URL ADMIN_SEED_PASSWORD
 
 # --- render --------------------------------------------------------------
 
@@ -282,7 +301,7 @@ step "Rendering manifests"
 # string when it is unset, so a lookup that silently returned nothing would
 # render a Secret containing "" — which applies cleanly, starts cleanly, and
 # then fails as a blanket 401 or a database connection error hours later.
-for required in ECR_REGISTRY IMAGE_PREFIX IMAGE_TAG APP_ORIGIN SHARED_SECRET DATABASE_URL; do
+for required in ECR_REGISTRY IMAGE_PREFIX IMAGE_TAG APP_ORIGIN SHARED_SECRET DATABASE_URL ADMIN_SEED_PASSWORD; do
   [ -n "${!required}" ] || die "$required resolved to an empty value; refusing to render the manifests"
 done
 
@@ -297,10 +316,10 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-# Only these six names are substituted. Left unrestricted, envsubst would
+# Only these seven names are substituted. Left unrestricted, envsubst would
 # also eat anything else in the manifests shaped like a shell variable —
 # a Traefik annotation or a container command, for instance.
-readonly SUBSTITUTED_VARS='${ECR_REGISTRY} ${IMAGE_PREFIX} ${IMAGE_TAG} ${APP_ORIGIN} ${SHARED_SECRET} ${DATABASE_URL}'
+readonly SUBSTITUTED_VARS='${ECR_REGISTRY} ${IMAGE_PREFIX} ${IMAGE_TAG} ${APP_ORIGIN} ${SHARED_SECRET} ${DATABASE_URL} ${ADMIN_SEED_PASSWORD}'
 
 manifest_count=0
 while IFS= read -r manifest; do
