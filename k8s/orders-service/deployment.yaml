@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-service
+  namespace: marketly
+  labels:
+    app: orders-service
+    app.kubernetes.io/part-of: marketly
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orders-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: orders-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orders-service
+          image: ${ECR_REGISTRY}/${IMAGE_PREFIX}-orders-service:${IMAGE_TAG}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5003
+          envFrom:
+            - secretRef:
+                name: orders-service-secrets
+            # Supplies CATALOG_SERVICE_URL. This is the only service that
+            # makes a server-to-server call, and it resolves catalog-service
+            # through cluster DNS rather than going back out to the ALB.
+            - configMapRef:
+                name: marketly-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # /health does not call catalog-service, so this pod is not marked
+          # unready when a dependency is struggling. Removing it from
+          # rotation would not help — every replica shares the same
+          # dependency — and would only remove capacity.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi

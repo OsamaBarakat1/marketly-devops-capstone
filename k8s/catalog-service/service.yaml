@@ -1,0 +1,22 @@
+# ClusterIP: reachable only from inside the cluster. Nothing here is exposed
+# directly — the Ingress is the single entry point, and orders-service
+# reaches this Service by name through cluster DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-service
+  namespace: marketly
+  labels:
+    app: catalog-service
+    app.kubernetes.io/part-of: marketly
+spec:
+  type: ClusterIP
+  selector:
+    app: catalog-service
+  ports:
+    - name: http
+      # The name orders-service resolves is this Service's, so the port here
+      # must match CATALOG_SERVICE_URL in the ConfigMap.
+      port: 5002
+      targetPort: http
+      protocol: TCP

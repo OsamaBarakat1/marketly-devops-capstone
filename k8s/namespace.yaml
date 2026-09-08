@@ -1,0 +1,16 @@
+# Everything the application owns lives here, so `kubectl delete namespace
+# marketly` is a complete uninstall and nothing leaks into kube-system.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marketly
+  labels:
+    app.kubernetes.io/part-of: marketly
+
+    # Pod Security Admission. "baseline" blocks the genuinely dangerous
+    # things — privileged containers, host networking, host paths — while
+    # still allowing the frontend's Nginx image to bind port 80 as root.
+    # "restricted" would additionally require every container to declare a
+    # non-root user, which Nginx's official image does not.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted

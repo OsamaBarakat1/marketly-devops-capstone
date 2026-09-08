@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-service
+  namespace: marketly
+  labels:
+    app: catalog-service
+    app.kubernetes.io/part-of: marketly
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: catalog-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the current replica count during a rollout: bring a
+      # new pod up, wait for it to pass readiness, then retire an old one.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: catalog-service
+    spec:
+      securityContext:
+        # Numeric, not a username. The kubelet cannot verify that a named
+        # user is non-root and refuses to start the container if asked to.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: catalog-service
+          image: ${ECR_REGISTRY}/${IMAGE_PREFIX}-catalog-service:${IMAGE_TAG}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5002
+          envFrom:
+            - secretRef:
+                name: catalog-service-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          # The process does not start serving until it has reached the
+          # database and created its schema, which can take up to a minute on
+          # a cold RDS instance. The startup probe covers that window; the
+          # liveness probe below only begins once this one has passed, so a
+          # slow start is never mistaken for a hang.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+
+          # Deliberately does not touch the database. If it did, a brief RDS
+          # blip would restart every pod at once and turn a recoverable
+          # problem into an outage.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Workers are t3.micro with under a gigabyte of usable memory, so
+          # requests are small enough for the scheduler to fit every
+          # component, and limits stop one pod starving its neighbours.
+          # The request is also what the HPA measures CPU against.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi

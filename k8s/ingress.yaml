@@ -1,0 +1,75 @@
+# Path-based routing to the four components. This is the same job the Vite
+# dev proxy does locally (see frontend/vite.config.js): keep the browser
+# seeing a single origin, so the httpOnly refresh cookie is sent on every
+# API call and no CORS preflight is involved.
+#
+# How traffic gets here: the ALB forwards to NodePort 30080, which Traefik
+# listens on across every node. That NodePort is pinned in the cluster
+# bootstrap rather than here — see the HelmChartConfig written by
+# terraform/modules/ec2-cluster/templates/control-plane-user-data.sh.tpl.
+# k3s ships Traefik as a LoadBalancer Service, which nothing in this cluster
+# can satisfy, and the ALB target group needs one fixed port present on
+# every node.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: marketly
+  namespace: marketly
+  labels:
+    app.kubernetes.io/part-of: marketly
+spec:
+  ingressClassName: traefik
+  rules:
+    # No host field: the ALB's generated DNS name is not known when this file
+    # is written, and matching on any host means the same manifest works
+    # through the load balancer, through a port-forward, or against a node's
+    # IP directly.
+    - http:
+        paths:
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 5001
+
+          - path: /api/products
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 5002
+
+          # Easy to miss: the catalog page loads its filter list from this
+          # separate path. Route only /api/products and the products appear
+          # but every category filter comes back empty, which reads as a
+          # frontend bug rather than a missing route.
+          - path: /api/categories
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 5002
+
+          - path: /api/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: orders-service
+                port:
+                  number: 5003
+
+          # Catch-all, last. Traefik matches longer prefixes first, so the
+          # API paths above win over this one; everything else is a
+          # client-side route and the frontend's Nginx serves index.html for
+          # it.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

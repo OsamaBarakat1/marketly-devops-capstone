@@ -1,0 +1,55 @@
+# Autoscaling on catalog-service. It is the right one to scale: every page
+# of the storefront hits it, orders-service calls it again for each line
+# item at checkout, and it is read-heavy, so extra replicas genuinely absorb
+# load rather than contending over the same rows.
+#
+# Requires metrics-server, which k3s installs by default. Without it the HPA
+# reports "unknown" for current utilization and never scales — the usual
+# first thing to check when an HPA looks stuck.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: catalog-service
+  namespace: marketly
+  labels:
+    app: catalog-service
+    app.kubernetes.io/part-of: marketly
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: catalog-service
+
+  minReplicas: 2
+  maxReplicas: 5
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # Percentage of the pod's CPU *request* (50m), not its limit. At
+          # 60% the target is roughly 30m per pod, so a load test only has to
+          # push past that to trigger a scale-out. Targeting the limit
+          # instead is the common mistake: the HPA would then need pods to
+          # near saturation before reacting.
+          type: Utilization
+          averageUtilization: 60
+
+  behavior:
+    scaleUp:
+      # React quickly, since the whole point is absorbing a traffic spike.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+    scaleDown:
+      # Retreat slowly. Scaling in the moment load dips causes flapping,
+      # where the HPA removes a pod and immediately needs it back.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
