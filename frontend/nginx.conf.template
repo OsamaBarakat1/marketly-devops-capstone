@@ -1,0 +1,50 @@
+# Serves the Vite production build and proxies /api/* to the three backend
+# services, mirroring the dev-time Vite proxy (see vite.config.js) and the
+# path-based routing the Kubernetes Ingress does in front of the real
+# deployment (see k8s/ingress.yaml). Host/port are env-substituted at
+# container start (see Dockerfile ENV defaults) so the same image works
+# against docker-compose service names without a rebuild.
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location /api/auth {
+        proxy_pass http://${AUTH_SERVICE_HOST}:${AUTH_SERVICE_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/products {
+        proxy_pass http://${CATALOG_SERVICE_HOST}:${CATALOG_SERVICE_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/categories {
+        proxy_pass http://${CATALOG_SERVICE_HOST}:${CATALOG_SERVICE_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/orders {
+        proxy_pass http://${ORDERS_SERVICE_HOST}:${ORDERS_SERVICE_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # SPA fallback: let React Router handle unknown paths client-side.
+    location / {
+        try_files $uri /index.html;
+    }
+}
