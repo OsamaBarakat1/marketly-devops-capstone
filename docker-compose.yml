@@ -1,0 +1,103 @@
+# Local multi-container stack: the four application components plus the
+# PostgreSQL instance that replaces the per-service SQLite files.
+#
+# Every value below is a non-sensitive local development default. Real
+# deployments get these from Kubernetes Secrets, never from this file.
+# Override any of them with a .env file (gitignored) — see .env.example.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-marketly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketly_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-marketly}
+    ports:
+      # Published so psql on the host can inspect the data during the
+      # SQLite to PostgreSQL migration.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marketly} -d ${POSTGRES_DB:-marketly}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  auth-service:
+    build: ./services/auth-service
+    environment:
+      # auth, catalog, and orders must share one value or the JWTs that
+      # auth issues fail verification in the other two.
+      SHARED_SECRET: ${SHARED_SECRET:-dev-shared-secret-change-me}
+      CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-http://localhost:5173}
+    ports:
+      - "5001:5001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  catalog-service:
+    build: ./services/catalog-service
+    environment:
+      SHARED_SECRET: ${SHARED_SECRET:-dev-shared-secret-change-me}
+    ports:
+      - "5002:5002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  orders-service:
+    build: ./services/orders-service
+    environment:
+      SHARED_SECRET: ${SHARED_SECRET:-dev-shared-secret-change-me}
+      # Priced and stock-checked against catalog-service over the compose
+      # network, never against values sent by the client.
+      CATALOG_SERVICE_URL: http://catalog-service:5002
+    ports:
+      - "5003:5003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build: ./frontend
+    # Nginx proxies /api to the backends using the hostnames baked into the
+    # image, which match the service names above.
+    ports:
+      - "5173:80"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      orders-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
