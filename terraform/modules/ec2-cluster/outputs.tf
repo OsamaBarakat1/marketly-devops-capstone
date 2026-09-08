@@ -24,3 +24,8 @@ output "server_role_arn" {
 output "agent_role_arn" {
   value = aws_iam_role.agent.arn
 }
+
+output "server_role_name" {
+  description = "Lets the root module grant the control plane extra read access without this module depending on rds."
+  value       = aws_iam_role.server.name
+}

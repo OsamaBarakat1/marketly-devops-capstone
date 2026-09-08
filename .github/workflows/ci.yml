@@ -1,0 +1,149 @@
+name: CI
+
+# Tests every change, and publishes images only from main.
+#
+# The AWS half of this workflow stays dormant until the infrastructure
+# exists: the publish job is skipped unless the AWS_ROLE_ARN repository
+# variable is set, so pushes stay green on a repository whose Terraform has
+# never been applied. Set that variable to the github_actions_role_arn
+# Terraform output to switch it on.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Required for OIDC: the workflow must be able to request an identity token
+# from GitHub to exchange for AWS credentials. Everything else is read-only.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # A newer commit makes an in-flight run obsolete. Cancelling avoids two
+  # runs racing to publish images.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------
+  # Exercises the real stack rather than each image in isolation, because
+  # the failures that matter here are between services: a JWT signed by
+  # auth-service and rejected by orders-service, or a price orders-service
+  # reads from catalog-service. Neither shows up in a unit test.
+  # ---------------------------------------------------------------
+  integration-test:
+    name: Integration test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the full stack
+        run: docker compose up -d --build --wait
+        env:
+          SHARED_SECRET: ci-shared-secret-for-this-run
+
+      - name: Health endpoints
+        run: |
+          set -euo pipefail
+          for port in 5001 5002 5003; do
+            status=$(curl -sf "http://localhost:$port/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
+            [ "$status" = "ok" ] || { echo "service on :$port unhealthy"; exit 1; }
+            echo "  :$port ok"
+          done
+
+      - name: Full purchase flow through the frontend proxy
+        run: |
+          set -euo pipefail
+          BASE=http://localhost:5173
+
+          token=$(curl -sf -X POST "$BASE/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"demo","password":"demo1234"}' \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+          echo "  login ok"
+
+          total=$(curl -sf "$BASE/api/products" | python3 -c 'import sys,json;print(json.load(sys.stdin)["total"])')
+          [ "$total" -gt 0 ] || { echo "catalog returned no products"; exit 1; }
+          echo "  catalog ok ($total products)"
+
+          before=$(curl -sf "$BASE/api/products/1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["stock"])')
+
+          # Proves the cross-service call: orders-service prices this from
+          # catalog-service and decrements its stock.
+          curl -sf -X POST "$BASE/api/orders" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $token" \
+            -d '{"items":[{"product_id":1,"quantity":2}]}' > /dev/null
+          echo "  order placed"
+
+          after=$(curl -sf "$BASE/api/products/1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["stock"])')
+          [ "$after" -eq "$((before - 2))" ] || {
+            echo "stock did not decrement: $before -> $after"; exit 1; }
+          echo "  stock decremented $before -> $after"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --tail=60
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------
+  # Publishes one image per component. Skipped entirely on pull requests
+  # and on repositories with no infrastructure yet.
+  # ---------------------------------------------------------------
+  publish:
+    name: Publish ${{ matrix.component }}
+    needs: integration-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One failed image should not hide whether the others built.
+      fail-fast: false
+      matrix:
+        include:
+          - component: auth-service
+            context: services/auth-service
+          - component: catalog-service
+            context: services/catalog-service
+          - component: orders-service
+            context: services/orders-service
+          - component: frontend
+            context: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No access key is stored anywhere. This exchanges GitHub's signed
+      # identity token for temporary AWS credentials, which the trust policy
+      # only issues to this repository on this branch.
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          # Tagged by commit only. The repositories are immutable, so a
+          # second push of any existing tag is rejected — and ":latest"
+          # would be rejected on the very next build. Deploying a specific
+          # commit is the point: it is what makes a rollback a real thing
+          # rather than a hope about what ":latest" pointed at.
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.IMAGE_PREFIX || 'marketly-dev' }}-${{ matrix.component }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false

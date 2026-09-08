@@ -109,3 +109,55 @@ module "iam_oidc" {
   state_bucket_name     = var.state_bucket_name
   state_lock_table_name = var.state_lock_table_name
 }
+
+# --- cross-module grant: what the self-hosted runner needs ---
+#
+# The CD runner lives on the control-plane instance and uses that instance's
+# role, so it needs to read the values a deployment is assembled from: the
+# RDS endpoint, the password RDS generated into Secrets Manager, and the
+# shared signing key in SSM.
+#
+# Deliberately declared here rather than inside the ec2-cluster module. If
+# that module took the secret ARN as an input it would depend on rds, and
+# the cluster would then sit waiting for a database that takes ten minutes
+# to create before it could even begin installing k3s.
+data "aws_iam_policy_document" "runner_reads" {
+  statement {
+    sid       = "ReadDatabasePassword"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.rds.master_user_secret_arn]
+  }
+
+  statement {
+    sid = "ReadAndCreateSharedSecret"
+    # PutParameter is included so the first deploy can generate the signing
+    # key itself. No human ever chooses or handles that value.
+    actions   = ["ssm:GetParameter", "ssm:PutParameter"]
+    resources = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name_prefix}/app/*"]
+  }
+
+  statement {
+    sid = "DiscoverEndpoints"
+    # Read-only lookups so the deploy resolves the database and load
+    # balancer addresses itself instead of depending on values pasted into
+    # repository variables.
+    actions = [
+      "rds:DescribeDBInstances",
+      "elasticloadbalancing:DescribeLoadBalancers",
+    ]
+    # These are list operations: AWS supports no resource-level permissions
+    # on either, so "*" is the only value they accept. Both are read-only
+    # and return no credential material — the password itself is guarded by
+    # the scoped statement above.
+    # tfsec:ignore:AVD-AWS-0057
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "runner_reads" {
+  name   = "${local.name_prefix}-runner-reads"
+  role   = module.ec2_cluster.server_role_name
+  policy = data.aws_iam_policy_document.runner_reads.json
+}
+
+data "aws_caller_identity" "current" {}

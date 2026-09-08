@@ -1,0 +1,187 @@
+name: Deploy
+
+# Runs on the self-hosted runner registered on the k3s control-plane
+# instance. That placement is the point: the runner is already inside the
+# VPC and already authenticated to the cluster, so the Kubernetes API never
+# has to be exposed publicly and no kubeconfig is stored as a GitHub secret.
+#
+# Gated on ENABLE_CD. Without it the job is skipped rather than queued
+# forever waiting for a runner that does not exist yet.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA to deploy (defaults to the current HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two rollouts of the same Deployment at once leave it in a state neither
+  # run intended.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Roll out to k3s
+    if: >-
+      vars.ENABLE_CD == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: self-hosted
+    timeout-minutes: 20
+
+    env:
+      NAMESPACE: marketly
+      IMAGE_PREFIX: ${{ vars.IMAGE_PREFIX || 'marketly-dev' }}
+      PROJECT_PREFIX: ${{ vars.PROJECT_PREFIX || 'marketly-dev' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      # k3s writes its kubeconfig here. The bootstrap script sets mode 0644
+      # so the runner's user can read it without sudo.
+      KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    steps:
+      - name: Resolve the commit to deploy
+        id: target
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            sha="${{ inputs.image_tag }}"
+            [ -n "$sha" ] || sha="${{ github.sha }}"
+          else
+            # workflow_run checks out the default branch tip by default,
+            # which may already be ahead of the commit CI built. Deploying
+            # that would ship an image tag ECR does not have.
+            sha="${{ github.event.workflow_run.head_sha }}"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Deploying $sha"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      # Everything below reads from AWS rather than from stored variables,
+      # so a rebuilt environment needs no manual reconfiguration. The
+      # instance role supplies the credentials; there are none on disk.
+      - name: Discover infrastructure
+        id: infra
+        run: |
+          set -euo pipefail
+
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "registry=$account.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+          rds=$(aws rds describe-db-instances \
+            --db-instance-identifier "$PROJECT_PREFIX-postgres" \
+            --query 'DBInstances[0].[Endpoint.Address,Endpoint.Port,DBName,MasterUsername,MasterUserSecret.SecretArn]' \
+            --output text)
+          echo "db_host=$(echo "$rds" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "db_port=$(echo "$rds" | cut -f2)" >> "$GITHUB_OUTPUT"
+          echo "db_name=$(echo "$rds" | cut -f3)" >> "$GITHUB_OUTPUT"
+          echo "db_user=$(echo "$rds" | cut -f4)" >> "$GITHUB_OUTPUT"
+          echo "db_secret_arn=$(echo "$rds" | cut -f5)" >> "$GITHUB_OUTPUT"
+
+          alb=$(aws elbv2 describe-load-balancers \
+            --names "$PROJECT_PREFIX-alb" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "app_origin=http://$alb" >> "$GITHUB_OUTPUT"
+          echo "Resolved ALB $alb"
+
+      - name: Render and apply manifests
+        env:
+          ECR_REGISTRY: ${{ steps.infra.outputs.registry }}
+          IMAGE_TAG: ${{ steps.target.outputs.sha }}
+          APP_ORIGIN: ${{ steps.infra.outputs.app_origin }}
+        run: |
+          set -euo pipefail
+
+          # The signing key shared by auth, catalog and orders. Generated
+          # once, on first deploy, and kept in SSM as a SecureString — never
+          # typed by a person, never in this repository, never in Terraform
+          # state.
+          param="/$PROJECT_PREFIX/app/shared-secret"
+          if ! SHARED_SECRET=$(aws ssm get-parameter --name "$param" \
+                --with-decryption --query Parameter.Value --output text 2>/dev/null); then
+            echo "Generating the shared signing key for the first time"
+            SHARED_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+            aws ssm put-parameter --name "$param" --type SecureString \
+              --value "$SHARED_SECRET" --description "JWT signing key shared by the Marketly services"
+          fi
+          export SHARED_SECRET
+
+          # RDS generated this password into Secrets Manager and Terraform
+          # never saw it, so it is read here at deploy time.
+          db_password=$(aws secretsmanager get-secret-value \
+            --secret-id '${{ steps.infra.outputs.db_secret_arn }}' \
+            --query SecretString --output text \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["password"])')
+
+          export DATABASE_URL="postgresql://${{ steps.infra.outputs.db_user }}:$(python3 -c '
+          import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$db_password")@${{ steps.infra.outputs.db_host }}:${{ steps.infra.outputs.db_port }}/${{ steps.infra.outputs.db_name }}"
+
+          rendered=$(mktemp -d)
+          # Only these names are substituted. Left unrestricted, envsubst
+          # would also eat anything else shaped like a shell variable in the
+          # manifests.
+          vars='${ECR_REGISTRY} ${IMAGE_PREFIX} ${IMAGE_TAG} ${APP_ORIGIN} ${SHARED_SECRET} ${DATABASE_URL}'
+          (cd k8s && find . -name '*.yaml' | while read -r f; do
+            mkdir -p "$rendered/$(dirname "$f")"
+            envsubst "$vars" < "$f" > "$rendered/$f"
+          done)
+
+          if grep -rq '\${' "$rendered"; then
+            echo "A placeholder was left unsubstituted:" >&2
+            grep -rn '\${' "$rendered" >&2
+            exit 1
+          fi
+
+          kubectl apply -f "$rendered/namespace.yaml"
+          kubectl apply -R -f "$rendered"
+
+          # The rendered copy holds real credentials in plaintext.
+          rm -rf "$rendered"
+
+      # The gate that decides whether this deploy succeeded. Without it the
+      # job would go green the moment the manifests were accepted, which
+      # says nothing about whether the new pods actually started.
+      - name: Verify rollout
+        run: |
+          set -euo pipefail
+          for d in auth-service catalog-service orders-service frontend; do
+            kubectl rollout status "deployment/$d" -n "$NAMESPACE" --timeout=5m
+          done
+
+      - name: Smoke test through the load balancer
+        env:
+          APP_ORIGIN: ${{ steps.infra.outputs.app_origin }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            if curl -sf "$APP_ORIGIN/api/products" -o /dev/null; then
+              echo "catalog reachable through the ALB"
+              exit 0
+            fi
+            echo "  waiting for the load balancer to report targets healthy ($i/12)"
+            sleep 10
+          done
+          echo "the application did not become reachable through the ALB" >&2
+          exit 1
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -30 || true
+          for d in auth-service catalog-service orders-service frontend; do
+            echo "--- $d ---"
+            kubectl logs "deployment/$d" -n "$NAMESPACE" --tail=40 || true
+          done

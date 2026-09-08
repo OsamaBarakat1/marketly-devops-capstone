@@ -1,0 +1,174 @@
+name: Terraform
+
+# Plans on pull requests and applies on merge, both authenticating over
+# OIDC. Only runs when Terraform actually changed — an application-only
+# commit has nothing to plan.
+#
+# Two safety gates, because this workflow creates and destroys real, billable
+# infrastructure:
+#
+#   AWS_ROLE_ARN unset            -> everything is skipped
+#   ENABLE_TERRAFORM_APPLY unset  -> plans still run, apply does not
+#
+# Apply stays off until deliberately switched on, so merging a Terraform
+# change can never start charging an account by surprise.
+
+on:
+  push:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform.yml"]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write # to leave the plan as a comment
+
+concurrency:
+  # State is shared and DynamoDB-locked. Serializing here turns a lock
+  # collision into a queued run rather than a failed one.
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  plan:
+    name: Plan
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    outputs:
+      exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Format check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Init
+        id: init
+        run: terraform init -input=false
+
+      - name: Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Plan
+        id: plan
+        # -detailed-exitcode distinguishes "no changes" (0) from "changes
+        # pending" (2), so the comment below can say which it was instead of
+        # making a reviewer read the whole output to find out.
+        run: |
+          set +e
+          terraform plan -no-color -input=false -lock-timeout=5m \
+            -var "github_repo=${{ github.repository }}" \
+            -detailed-exitcode -out=tfplan > plan.txt 2>&1
+          code=$?
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          tail -c 60000 plan.txt
+          exit $([ $code -eq 1 ] && echo 1 || echo 0)
+
+      - name: Comment plan on the pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          FMT: ${{ steps.fmt.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          CODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+
+            // A comment is capped at 65536 characters; a large plan has to
+            // be trimmed or the API call fails and the reviewer gets nothing.
+            const LIMIT = 55000;
+            if (plan.length > LIMIT) {
+              plan = plan.slice(-LIMIT);
+              plan = '...output trimmed, see the workflow log for the full plan...\n' + plan;
+            }
+
+            const verdict = process.env.CODE === '2'
+              ? 'Changes pending'
+              : (process.env.CODE === '0' ? 'No changes' : 'Plan failed');
+
+            const body = [
+              `### Terraform — ${verdict}`,
+              '',
+              `Format \`${process.env.FMT}\` · Validate \`${process.env.VALIDATE}\``,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Fail if the plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+  apply:
+    name: Apply
+    needs: plan
+    # Both gates plus a merge to main. Anything less does not apply.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.AWS_ROLE_ARN != '' &&
+      vars.ENABLE_TERRAFORM_APPLY == 'true'
+    runs-on: ubuntu-latest
+    # A protected environment adds a human approval step in repository
+    # settings, which is worth configuring before this ever runs.
+    environment: aws-infrastructure
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Init
+        run: terraform init -input=false
+
+      # Re-planned here rather than reusing the pull request's plan file:
+      # main may have moved since, and applying a stale plan would act on a
+      # state that no longer exists.
+      - name: Apply
+        run: |
+          terraform apply -auto-approve -input=false -lock-timeout=5m \
+            -var "github_repo=${{ github.repository }}"
+
+      - name: Outputs
+        run: terraform output -no-color
