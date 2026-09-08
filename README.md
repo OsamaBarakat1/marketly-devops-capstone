@@ -44,7 +44,7 @@ GitHub Actions (CD, self-hosted runner on the k3s control-plane) ──┘
 │   sitting in the public subnet — not a paid NAT Gateway.                           │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 
-Amazon S3 — holds Terraform remote state and database backups (outside the VPC)
+Amazon S3 — holds Terraform remote state, with a DynamoDB lock table (outside the VPC)
 Amazon ECR — 4 image repositories: auth-service, catalog-service, orders-service, frontend
 ```
 
@@ -69,7 +69,7 @@ Why this shape, specifically:
 
 ## 3. What's provided vs. what you build
 
-| Provided & working | You build, currently empty |
+| Provided & working | Built for this project |
 |---|---|
 | `services/auth-service/` (Flask + SQLite + JWT) | `services/*/Dockerfile`, `frontend/Dockerfile` |
 | `services/catalog-service/` (Flask + SQLite) | `terraform/` — root files + 8 modules |
@@ -117,27 +117,62 @@ cd services/orders-service && python -m venv venv && source venv/bin/activate &&
 cd frontend && npm install && npm run dev
 ```
 
-Once everything else is built, write the 4 scripts in `scripts/` (currently
-empty):
+The four scripts in `scripts/` automate the rest. Each uses
+`set -euo pipefail`, takes `--help`, and exits non-zero on failure.
 
-- **`setup.sh`** — checks that `aws`, `kubectl`, `terraform`, `docker`, `git`
-  are installed before anyone wastes an hour debugging a missing CLI.
-- **`deploy.sh`** — a local wrapper around `terraform apply` +
-  `kubectl apply`, so you can test infra/deploy changes without waiting on
-  GitHub Actions.
-- **`healthcheck.sh`** — curls `/health` on all 3 backend services and checks
-  pod status; this is your first debugging tool when something's broken.
-- **`teardown.sh`** — `terraform destroy` behind a confirmation prompt. Run
-  this at the end of every work session — see §6 on cost.
+- **`setup.sh`** — checks the eight CLIs the other scripts shell out to
+  (`aws`, `terraform`, `kubectl`, `docker`, `git`, `curl`, `envsubst`,
+  `python3`), that Terraform is at least 1.6 and the AWS CLI is v2, that the
+  Docker daemon is up, and that AWS credentials resolve. Missing tools are
+  fatal; missing configuration is reported as a warning, because a fresh
+  clone legitimately has none yet.
 
-Use `set -euo pipefail` in every script so failures stop execution instead of
-silently continuing.
+  ```bash
+  scripts/setup.sh
+  ```
+
+- **`deploy.sh`** — `terraform apply`, then the cluster half: it discovers
+  the registry, database and load balancer from AWS, reads the signing key
+  and admin password from SSM and the database password from Secrets
+  Manager, renders the manifests, applies them and waits for all four
+  rollouts. `.github/workflows/deploy.yml` calls this same script rather
+  than repeating the logic, so CI exercises exactly what you run by hand.
+
+  ```bash
+  scripts/deploy.sh                      # infrastructure, then deploy HEAD
+  scripts/deploy.sh --skip-terraform     # deploy only
+  scripts/deploy.sh --tag <sha> --yes    # redeploy an earlier image
+  ```
+
+- **`healthcheck.sh`** — the first thing to run when something is broken.
+  Four layers, checked from the inside out so the output says *which* one
+  failed: nodes, deployments, each backend's `/health` through a
+  port-forward, then a request through the load balancer.
+
+  ```bash
+  scripts/healthcheck.sh
+  ```
+
+- **`teardown.sh`** — shows the destroy plan, then asks you to type the
+  project prefix rather than `y`, because this deletes a database. Run it at
+  the end of every work session — see §7 on cost.
+
+  ```bash
+  scripts/teardown.sh
+  ```
+
+**One thing to know about the last two:** the k3s API server has no public
+address and there is no SSH key, so `deploy.sh`'s cluster half and all of
+`healthcheck.sh` only work from inside the VPC — on the control-plane
+instance, reached over SSM. Both scripts detect this and print the exact
+`aws ssm start-session` command rather than failing halfway. The Terraform
+half of `deploy.sh` runs fine from a laptop.
 
 ### 5.2 Docker
 
-Write one Dockerfile per component (`services/auth-service/Dockerfile`,
+One Dockerfile per component (`services/auth-service/Dockerfile`,
 `services/catalog-service/Dockerfile`, `services/orders-service/Dockerfile`,
-`frontend/Dockerfile` — all currently empty 0-byte files).
+`frontend/Dockerfile`).
 
 - The 3 backend services are plain Python/Flask — a simple `python:3.12-slim`
   base, `pip install -r requirements.txt`, `CMD ["python", "app.py"]` is
@@ -223,9 +258,11 @@ does:
   service's data lives once you complete the SQLite → Postgres migration
   (§5.6), since it's reachable from every worker node identically, unlike a
   local SQLite file that only exists on one machine.
-- **Amazon S3** — object storage, used here for two things outside the VPC
-  entirely: Terraform's remote state file (so state isn't just sitting on
-  one person's laptop) and a destination for periodic database backups.
+- **Amazon S3** — object storage, used here for one thing outside the VPC
+  entirely: Terraform's remote state file, so state isn't just sitting on one
+  person's laptop. A DynamoDB table alongside it serializes concurrent runs.
+  Database backups are *not* shipped here — `modules/rds` sets
+  `backup_retention_period = 7`, which is RDS's own automated snapshots.
 
 Bring the cluster up and confirm it manually before writing any Kubernetes
 YAML:
@@ -300,22 +337,39 @@ pod can starve its neighbors.
 
 ### 5.8 CI/CD — GitHub Actions
 
-Three workflows in `.github/workflows/` (currently empty):
+Four workflows in `.github/workflows/`:
 
-1. **`ci.yml`** — on PR and push to `main`: run any tests, build all 4 Docker
-   images, and (on `main` only) push them to their ECR repos. Authenticate to
-   AWS via the OIDC role from `modules/iam-oidc` — **no static AWS access
-   keys stored as GitHub secrets, ever.**
+1. **`ci.yml`** — on PR and push to `main`. The test job brings the whole
+   stack up with `docker compose` and drives a real purchase end to end:
+   log in, read the catalog, place an order, assert the stock decremented.
+   That is deliberate — the failures that matter here are *between* services
+   (a token auth-service signs and orders-service rejects, a price read from
+   the wrong source), and a unit test on one service catches none of them.
+   On `main` it then builds all 4 images and pushes them to ECR via the OIDC
+   role from `modules/iam-oidc` — **no static AWS access keys stored as
+   GitHub secrets, ever.** Images are tagged by commit SHA only; the
+   repositories are immutable, so there is no `:latest` to be vague about.
 2. **`terraform.yml`** — `terraform plan` commented on every PR that touches
-   `terraform/`; `terraform apply` on merge to `main`, also via OIDC.
+   `terraform/`; `terraform apply` on merge to `main`, also via OIDC. Apply
+   is additionally gated on the `ENABLE_TERRAFORM_APPLY` variable, so merging
+   a Terraform change can never start billing an account by surprise.
 3. **`deploy.yml`** — runs on the **self-hosted runner** registered on the
-   k3s control-plane instance (register it once, manually or via a setup
-   script, following GitHub's repo settings → Actions → Runners flow). Its
-   job just runs `kubectl apply -f k8s/` and `kubectl rollout status` for
-   each Deployment, using the new image tags `ci.yml` just pushed. Because
-   the runner lives inside your VPC already authenticated to the cluster,
-   you never need to expose the Kubernetes API publicly or manage a
-   kubeconfig secret in GitHub.
+   k3s control-plane instance (register it once, following GitHub's repo
+   settings → Actions → Runners flow). It calls `scripts/deploy.sh` and
+   `scripts/healthcheck.sh` rather than repeating their logic, so there is
+   one implementation of the deploy and CI exercises the same code path you
+   run by hand. Because the runner lives inside the VPC already
+   authenticated to the cluster, the Kubernetes API is never exposed
+   publicly and no kubeconfig is stored as a GitHub secret.
+4. **`security.yml`** — gitleaks across the full commit history (a secret
+   removed in a later commit is still a leak if an earlier one holds it), and
+   tfsec over `terraform/`. This is the backstop for the `.githooks`
+   pre-commit hook, which only protects clones that opted into it.
+
+One subtlety in `deploy.yml` worth knowing: a `workflow_run` trigger checks
+out the default branch tip by default, which may already be ahead of the
+commit CI built. It pins the checkout to `workflow_run.head_sha` instead —
+otherwise it would deploy an image tag that ECR does not have.
 
 ## 6. How everything connects (the full request/deploy lifecycle)
 
@@ -353,5 +407,10 @@ the very end of the project.
 - [`PROJECT_BRIEF.md`](./PROJECT_BRIEF.md) — milestones, deliverables,
   submission checklist.
 - [`RUBRIC.md`](./RUBRIC.md) — exact point breakdown.
+- [`docs/architecture-diagram.md`](./docs/architecture-diagram.md) — what the
+  diagram shows, and where it is deliberately simplified.
+- [`docs/debugging-writeup.md`](./docs/debugging-writeup.md) — one thing that
+  broke and how it was tracked down: an Nginx proxy caching a container
+  address that another service had since been given.
 - Each service and the frontend has its own `README.md` with exact run
   instructions and environment variables.
