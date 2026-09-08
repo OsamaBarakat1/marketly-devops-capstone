@@ -69,112 +69,26 @@ jobs:
         with:
           ref: ${{ steps.target.outputs.sha }}
 
-      # Everything below reads from AWS rather than from stored variables,
-      # so a rebuilt environment needs no manual reconfiguration. The
-      # instance role supplies the credentials; there are none on disk.
-      - name: Discover infrastructure
-        id: infra
-        run: |
-          set -euo pipefail
+      # scripts/deploy.sh is the single implementation of the deploy: it
+      # discovers the registry, database and load balancer from AWS, reads
+      # the signing key from SSM and the database password from Secrets
+      # Manager, renders the manifests, applies them, and waits for all four
+      # rollouts. Repeating any of that here would give it a second copy to
+      # drift from, and would mean CI never exercised the script a developer
+      # runs by hand.
+      #
+      # --skip-terraform because terraform.yml owns infrastructure; this job
+      # only moves the cluster to a new image tag. Credentials come from the
+      # instance role — there are none on disk.
+      - name: Deploy
+        run: scripts/deploy.sh --skip-terraform --tag "${{ steps.target.outputs.sha }}" --yes
 
-          account=$(aws sts get-caller-identity --query Account --output text)
-          echo "registry=$account.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_OUTPUT"
-
-          rds=$(aws rds describe-db-instances \
-            --db-instance-identifier "$PROJECT_PREFIX-postgres" \
-            --query 'DBInstances[0].[Endpoint.Address,Endpoint.Port,DBName,MasterUsername,MasterUserSecret.SecretArn]' \
-            --output text)
-          echo "db_host=$(echo "$rds" | cut -f1)" >> "$GITHUB_OUTPUT"
-          echo "db_port=$(echo "$rds" | cut -f2)" >> "$GITHUB_OUTPUT"
-          echo "db_name=$(echo "$rds" | cut -f3)" >> "$GITHUB_OUTPUT"
-          echo "db_user=$(echo "$rds" | cut -f4)" >> "$GITHUB_OUTPUT"
-          echo "db_secret_arn=$(echo "$rds" | cut -f5)" >> "$GITHUB_OUTPUT"
-
-          alb=$(aws elbv2 describe-load-balancers \
-            --names "$PROJECT_PREFIX-alb" \
-            --query 'LoadBalancers[0].DNSName' --output text)
-          echo "app_origin=http://$alb" >> "$GITHUB_OUTPUT"
-          echo "Resolved ALB $alb"
-
-      - name: Render and apply manifests
-        env:
-          ECR_REGISTRY: ${{ steps.infra.outputs.registry }}
-          IMAGE_TAG: ${{ steps.target.outputs.sha }}
-          APP_ORIGIN: ${{ steps.infra.outputs.app_origin }}
-        run: |
-          set -euo pipefail
-
-          # The signing key shared by auth, catalog and orders. Generated
-          # once, on first deploy, and kept in SSM as a SecureString — never
-          # typed by a person, never in this repository, never in Terraform
-          # state.
-          param="/$PROJECT_PREFIX/app/shared-secret"
-          if ! SHARED_SECRET=$(aws ssm get-parameter --name "$param" \
-                --with-decryption --query Parameter.Value --output text 2>/dev/null); then
-            echo "Generating the shared signing key for the first time"
-            SHARED_SECRET=$(openssl rand -base64 48 | tr -d '\n')
-            aws ssm put-parameter --name "$param" --type SecureString \
-              --value "$SHARED_SECRET" --description "JWT signing key shared by the Marketly services"
-          fi
-          export SHARED_SECRET
-
-          # RDS generated this password into Secrets Manager and Terraform
-          # never saw it, so it is read here at deploy time.
-          db_password=$(aws secretsmanager get-secret-value \
-            --secret-id '${{ steps.infra.outputs.db_secret_arn }}' \
-            --query SecretString --output text \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["password"])')
-
-          export DATABASE_URL="postgresql://${{ steps.infra.outputs.db_user }}:$(python3 -c '
-          import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$db_password")@${{ steps.infra.outputs.db_host }}:${{ steps.infra.outputs.db_port }}/${{ steps.infra.outputs.db_name }}"
-
-          rendered=$(mktemp -d)
-          # Only these names are substituted. Left unrestricted, envsubst
-          # would also eat anything else shaped like a shell variable in the
-          # manifests.
-          vars='${ECR_REGISTRY} ${IMAGE_PREFIX} ${IMAGE_TAG} ${APP_ORIGIN} ${SHARED_SECRET} ${DATABASE_URL}'
-          (cd k8s && find . -name '*.yaml' | while read -r f; do
-            mkdir -p "$rendered/$(dirname "$f")"
-            envsubst "$vars" < "$f" > "$rendered/$f"
-          done)
-
-          if grep -rq '\${' "$rendered"; then
-            echo "A placeholder was left unsubstituted:" >&2
-            grep -rn '\${' "$rendered" >&2
-            exit 1
-          fi
-
-          kubectl apply -f "$rendered/namespace.yaml"
-          kubectl apply -R -f "$rendered"
-
-          # The rendered copy holds real credentials in plaintext.
-          rm -rf "$rendered"
-
-      # The gate that decides whether this deploy succeeded. Without it the
-      # job would go green the moment the manifests were accepted, which
-      # says nothing about whether the new pods actually started.
-      - name: Verify rollout
-        run: |
-          set -euo pipefail
-          for d in auth-service catalog-service orders-service frontend; do
-            kubectl rollout status "deployment/$d" -n "$NAMESPACE" --timeout=5m
-          done
-
-      - name: Smoke test through the load balancer
-        env:
-          APP_ORIGIN: ${{ steps.infra.outputs.app_origin }}
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 12); do
-            if curl -sf "$APP_ORIGIN/api/products" -o /dev/null; then
-              echo "catalog reachable through the ALB"
-              exit 0
-            fi
-            echo "  waiting for the load balancer to report targets healthy ($i/12)"
-            sleep 10
-          done
-          echo "the application did not become reachable through the ALB" >&2
-          exit 1
+      # The same four-layer check a developer runs when something breaks:
+      # nodes, deployments, each backend's /health, and a request through
+      # the load balancer. Rollout status alone only proves the pods
+      # started, not that a request survives the whole path.
+      - name: Health check
+        run: scripts/healthcheck.sh --wait 120
 
       - name: Diagnostics on failure
         if: failure()
