@@ -36,3 +36,49 @@ jobs:
 
       - name: Scan full git history
         run: gitleaks detect --source . --redact --verbose
+
+  iac-scan:
+    name: Terraform security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tfsec
+        env:
+          TFSEC_VERSION: 1.28.14
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/tfsec-linux-amd64" -o tfsec
+          sudo install tfsec /usr/local/bin/tfsec
+          tfsec --version
+
+      # Catches misconfiguration that `terraform validate` cannot: a bucket
+      # left public, an unencrypted volume, a security group open to the
+      # world. Findings that are deliberate carry a `tfsec:ignore` comment
+      # with the reason, so anything reported here is genuinely unreviewed.
+      - name: Scan Terraform
+        run: tfsec terraform --no-color
+
+  terraform-validate:
+    name: Terraform validate and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      # -backend=false means no credentials and no remote state are needed,
+      # so this runs on a pull request from anyone without granting AWS access.
+      - name: Init without backend
+        run: terraform init -backend=false
+        working-directory: terraform
+
+      - name: Validate
+        run: terraform validate
+        working-directory: terraform
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+        working-directory: terraform
