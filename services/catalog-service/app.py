@@ -1,6 +1,6 @@
 """
 catalog-service
-Owns its own SQLite database (catalog.db). Seeds sample products across a
+Owns the `catalog` schema in PostgreSQL. Seeds sample products across a
 few categories on first run.
 
 Read endpoints (list/detail/categories) are public. Write endpoints
@@ -16,15 +16,23 @@ Run standalone:
 Listens on :5002
 """
 import os
-import sqlite3
+import time
 import math
 
 import jwt
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-DB_PATH = os.environ.get("CATALOG_DB_PATH", os.path.join(os.path.dirname(__file__), "catalog.db"))
+# No default: a connection string is environment-specific and embedding one
+# here would either hardcode an endpoint or commit a credential.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "catalog")
+INIT_LOCK_KEY = 4711002
+
 SHARED_SECRET = os.environ.get("SHARED_SECRET", "dev-shared-secret-change-me")
 CORS_ALLOWED_ORIGIN = os.environ.get("CORS_ALLOWED_ORIGIN", "http://localhost:5173")
 
@@ -72,42 +80,95 @@ def cors_preflight(_unused=None):
     return "", 204
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def connect(autocommit=True):
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Point it at PostgreSQL, e.g. "
+            "postgresql://user:password@host:5432/marketly"
+        )
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        options=f"-c search_path={DB_SCHEMA}",
+        cursor_factory=RealDictCursor,
+    )
+    conn.autocommit = autocommit
     return conn
 
 
-def init_db():
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT,
-            price REAL NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            category TEXT NOT NULL DEFAULT 'General',
-            image_url TEXT DEFAULT ''
-        )
-        """
-    )
-    # Backfill columns for anyone upgrading from the old schema.
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(products)")}
-    if "category" not in existing_cols:
-        conn.execute("ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT 'General'")
-    if "image_url" not in existing_cols:
-        conn.execute("ALTER TABLE products ADD COLUMN image_url TEXT DEFAULT ''")
+def get_db():
+    return connect()
 
-    count = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
-    if count == 0:
-        conn.executemany(
-            "INSERT INTO products (name, description, price, stock, category, image_url) VALUES (?, ?, ?, ?, ?, ?)",
-            SEED_PRODUCTS,
-        )
-    conn.commit()
-    conn.close()
+
+def query_one(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchone()
+
+
+def query_all(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchall()
+
+
+def execute(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+
+
+def init_db(max_wait_seconds=60):
+    """Creates the schema and seeds products, safely under concurrency.
+
+    The seed is the reason this needs a lock: every replica starts with an
+    empty table in view, and without serialization each one would insert its
+    own copy of SEED_PRODUCTS, leaving the catalog duplicated N times.
+    """
+    deadline = time.monotonic() + max_wait_seconds
+    while True:
+        try:
+            conn = connect(autocommit=False)
+            break
+        except psycopg2.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (INIT_LOCK_KEY,))
+                cur.execute(
+                    sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                        sql.Identifier(DB_SCHEMA)
+                    )
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS products (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        description TEXT,
+                        price DOUBLE PRECISION NOT NULL,
+                        stock INTEGER NOT NULL DEFAULT 0,
+                        category TEXT NOT NULL DEFAULT 'General',
+                        image_url TEXT DEFAULT ''
+                    )
+                    """
+                )
+                # Listing filters and sorts by category on every catalog page.
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS products_category_idx ON products (category)"
+                )
+
+                cur.execute("SELECT COUNT(*) AS c FROM products")
+                if cur.fetchone()["c"] == 0:
+                    cur.executemany(
+                        "INSERT INTO products (name, description, price, stock, category, image_url) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        SEED_PRODUCTS,
+                    )
+    finally:
+        conn.close()
 
 
 def row_to_dict(row):
@@ -145,7 +206,7 @@ def health():
 @app.route("/api/categories", methods=["GET"])
 def list_categories():
     conn = get_db()
-    rows = conn.execute("SELECT DISTINCT category FROM products ORDER BY category").fetchall()
+    rows = query_all(conn, "SELECT DISTINCT category FROM products ORDER BY category")
     conn.close()
     return jsonify([r["category"] for r in rows]), 200
 
@@ -167,20 +228,24 @@ def list_products():
     where = []
     params = []
     if q:
-        where.append("(name LIKE ? OR description LIKE ?)")
+        # ILIKE, not LIKE: SQLite's LIKE ignored case for ASCII, PostgreSQL's
+        # does not, so a plain port would silently break search for anyone
+        # who does not match the stored capitalisation.
+        where.append("(name ILIKE %s OR description ILIKE %s)")
         params += [f"%{q}%", f"%{q}%"]
     if category:
-        where.append("category = ?")
+        where.append("category = %s")
         params.append(category)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     order_sql = SORT_COLUMNS.get(sort, SORT_COLUMNS["newest"])
 
     conn = get_db()
-    total = conn.execute(f"SELECT COUNT(*) AS c FROM products {where_sql}", params).fetchone()["c"]
-    rows = conn.execute(
-        f"SELECT * FROM products {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+    total = query_one(conn, f"SELECT COUNT(*) AS c FROM products {where_sql}", params)["c"]
+    rows = query_all(
+        conn,
+        f"SELECT * FROM products {where_sql} ORDER BY {order_sql} LIMIT %s OFFSET %s",
         params + [page_size, (page - 1) * page_size],
-    ).fetchall()
+    )
     conn.close()
 
     return jsonify(
@@ -195,7 +260,7 @@ def list_products():
 @app.route("/api/products/<int:product_id>", methods=["GET"])
 def get_product(product_id):
     conn = get_db()
-    row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+    row = query_one(conn, "SELECT * FROM products WHERE id = %s", (product_id,))
     conn.close()
     if not row:
         return jsonify(error="product not found"), 404
@@ -216,8 +281,10 @@ def create_product():
         return jsonify(error="validation failed", fields={"price": "must be a non-negative number"}), 400
 
     conn = get_db()
-    cur = conn.execute(
-        "INSERT INTO products (name, description, price, stock, category, image_url) VALUES (?, ?, ?, ?, ?, ?)",
+    row = query_one(
+        conn,
+        "INSERT INTO products (name, description, price, stock, category, image_url) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
         (
             name,
             data.get("description", ""),
@@ -227,9 +294,6 @@ def create_product():
             data.get("image_url", ""),
         ),
     )
-    conn.commit()
-    new_id = cur.lastrowid
-    row = conn.execute("SELECT * FROM products WHERE id = ?", (new_id,)).fetchone()
     conn.close()
     return jsonify(row_to_dict(row)), 201
 
@@ -240,17 +304,19 @@ def update_product(product_id):
         return jsonify(error="admin role required"), 403
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+    row = query_one(conn, "SELECT * FROM products WHERE id = %s", (product_id,))
     if not row:
         conn.close()
         return jsonify(error="product not found"), 404
 
     data = request.get_json(force=True) or {}
-    conn.execute(
+    row = query_one(
+        conn,
         """
         UPDATE products SET
-            name = ?, description = ?, price = ?, stock = ?, category = ?, image_url = ?
-        WHERE id = ?
+            name = %s, description = %s, price = %s, stock = %s, category = %s, image_url = %s
+        WHERE id = %s
+        RETURNING *
         """,
         (
             data.get("name", row["name"]),
@@ -262,8 +328,6 @@ def update_product(product_id):
             product_id,
         ),
     )
-    conn.commit()
-    row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     conn.close()
     return jsonify(row_to_dict(row)), 200
 
@@ -274,13 +338,10 @@ def delete_product(product_id):
         return jsonify(error="admin role required"), 403
 
     conn = get_db()
-    row = conn.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone()
-    if not row:
-        conn.close()
-        return jsonify(error="product not found"), 404
-    conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    conn.commit()
+    row = query_one(conn, "DELETE FROM products WHERE id = %s RETURNING id", (product_id,))
     conn.close()
+    if not row:
+        return jsonify(error="product not found"), 404
     return jsonify(message="deleted"), 200
 
 
@@ -295,20 +356,26 @@ def adjust_stock(product_id):
     if delta is None:
         return jsonify(error="delta is required"), 400
 
+    delta = int(delta)
     conn = get_db()
-    row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-    if not row:
+    # Applied as a single atomic statement rather than read, add, write.
+    # With several replicas serving checkouts concurrently, the read-then-
+    # write version lets two callers read the same stock and both write back,
+    # overselling the last unit. The guard is part of the UPDATE so the row
+    # is locked for the check and the decrement together.
+    row = query_one(
+        conn,
+        "UPDATE products SET stock = stock + %s WHERE id = %s AND stock + %s >= 0 RETURNING *",
+        (delta, product_id, delta),
+    )
+    if row is None:
+        # No row updated: either it does not exist, or the guard rejected it.
+        exists = query_one(conn, "SELECT 1 FROM products WHERE id = %s", (product_id,))
         conn.close()
-        return jsonify(error="product not found"), 404
-
-    new_stock = row["stock"] + int(delta)
-    if new_stock < 0:
-        conn.close()
+        if not exists:
+            return jsonify(error="product not found"), 404
         return jsonify(error="insufficient stock"), 409
 
-    conn.execute("UPDATE products SET stock = ? WHERE id = ?", (new_stock, product_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     conn.close()
     return jsonify(row_to_dict(row)), 200
 

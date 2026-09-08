@@ -30,6 +30,9 @@ categories on first run.
 
 ## Environment variables
 
-- `CATALOG_DB_PATH` — path to SQLite file (default: `catalog.db` next to app.py)
+- `DATABASE_URL` — **required**, PostgreSQL connection string
+  (`postgresql://user:password@host:5432/marketly`). No default: the service
+  fails to start rather than silently using some other database.
+- `DB_SCHEMA` — schema this service owns (default `catalog`).
 - `SHARED_SECRET` — JWT verification secret. **Must match** auth-service's
   value so admin tokens issued by auth-service are accepted here.

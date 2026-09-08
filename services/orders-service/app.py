@@ -1,6 +1,6 @@
 """
 orders-service
-Owns its own SQLite database (orders.db). Verifies JWTs locally using the
+Owns the `orders` schema in PostgreSQL. Verifies JWTs locally using the
 same SHARED_SECRET as auth-service (no network call needed to authenticate).
 
 For every order line item it calls catalog-service over HTTP to confirm the
@@ -16,17 +16,25 @@ Run standalone:
 Listens on :5003. Requires catalog-service running (default http://localhost:5002).
 """
 import os
-import sqlite3
+import time
 import datetime
 import json
 
 import jwt
 import requests
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-DB_PATH = os.environ.get("ORDERS_DB_PATH", os.path.join(os.path.dirname(__file__), "orders.db"))
+# No default: a connection string is environment-specific and embedding one
+# here would either hardcode an endpoint or commit a credential.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "orders")
+INIT_LOCK_KEY = 4711003
+
 SHARED_SECRET = os.environ.get("SHARED_SECRET", "dev-shared-secret-change-me")
 CATALOG_SERVICE_URL = os.environ.get("CATALOG_SERVICE_URL", "http://localhost:5002")
 CORS_ALLOWED_ORIGIN = os.environ.get("CORS_ALLOWED_ORIGIN", "http://localhost:5173")
@@ -56,34 +64,83 @@ def cors_preflight(_unused=None):
     return "", 204
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def connect(autocommit=True):
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Point it at PostgreSQL, e.g. "
+            "postgresql://user:password@host:5432/marketly"
+        )
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        options=f"-c search_path={DB_SCHEMA}",
+        cursor_factory=RealDictCursor,
+    )
+    conn.autocommit = autocommit
     return conn
 
 
-def init_db():
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            items_json TEXT NOT NULL,
-            total REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
-    if "status" not in existing_cols:
-        conn.execute("ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
-    if "updated_at" not in existing_cols:
-        conn.execute("ALTER TABLE orders ADD COLUMN updated_at TEXT")
-    conn.commit()
-    conn.close()
+def get_db():
+    return connect()
+
+
+def query_one(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchone()
+
+
+def query_all(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchall()
+
+
+def execute(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+
+
+def init_db(max_wait_seconds=60):
+    """Creates the schema, tolerating a database that is not up yet and
+    other replicas running the same statements concurrently."""
+    deadline = time.monotonic() + max_wait_seconds
+    while True:
+        try:
+            conn = connect(autocommit=False)
+            break
+        except psycopg2.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (INIT_LOCK_KEY,))
+                cur.execute(
+                    sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                        sql.Identifier(DB_SCHEMA)
+                    )
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS orders (
+                        id SERIAL PRIMARY KEY,
+                        username TEXT NOT NULL,
+                        items_json TEXT NOT NULL,
+                        total DOUBLE PRECISION NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                # Every customer-facing read filters by username.
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS orders_username_idx ON orders (username)"
+                )
+    finally:
+        conn.close()
 
 
 def decode_token():
@@ -198,12 +255,12 @@ def create_order():
 
     now = datetime.datetime.utcnow().isoformat()
     conn = get_db()
-    cur = conn.execute(
-        "INSERT INTO orders (username, items_json, total, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)",
+    row = query_one(
+        conn,
+        "INSERT INTO orders (username, items_json, total, status, created_at, updated_at) "
+        "VALUES (%s, %s, %s, 'pending', %s, %s) RETURNING *",
         (username, json.dumps(order_items), total, now, now),
     )
-    conn.commit()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (cur.lastrowid,)).fetchone()
     conn.close()
 
     return jsonify(order_to_dict(row)), 201
@@ -224,9 +281,9 @@ def list_orders():
         return jsonify(error="missing or invalid bearer token"), 401
 
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM orders WHERE username = ? ORDER BY id DESC", (username,)
-    ).fetchall()
+    rows = query_all(
+        conn, "SELECT * FROM orders WHERE username = %s ORDER BY id DESC", (username,)
+    )
     conn.close()
     return jsonify([order_to_dict(r) for r in rows]), 200
 
@@ -238,7 +295,7 @@ def get_order(order_id):
         return jsonify(error="missing or invalid bearer token"), 401
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    row = query_one(conn, "SELECT * FROM orders WHERE id = %s", (order_id,))
     conn.close()
     if not row or row["username"] != username:
         return jsonify(error="order not found"), 404
@@ -252,7 +309,7 @@ def cancel_order(order_id):
         return jsonify(error="missing or invalid bearer token"), 401
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    row = query_one(conn, "SELECT * FROM orders WHERE id = %s", (order_id,))
     if not row or row["username"] != username:
         conn.close()
         return jsonify(error="order not found"), 404
@@ -260,17 +317,27 @@ def cancel_order(order_id):
         conn.close()
         return jsonify(error=f"cannot cancel an order with status '{row['status']}'"), 409
 
+    # Claim the cancellation before restoring stock. Two concurrent cancels
+    # of one order would otherwise both pass the check above and each restore
+    # the same units, inflating stock.
+    now = datetime.datetime.utcnow().isoformat()
+    row = query_one(
+        conn,
+        "UPDATE orders SET status = 'cancelled', updated_at = %s "
+        "WHERE id = %s AND status = 'pending' RETURNING *",
+        (now, order_id),
+    )
+    if row is None:
+        conn.close()
+        return jsonify(error="cannot cancel an order that is no longer pending"), 409
+    conn.close()
+
     for item in json.loads(row["items_json"]):
         try:
             adjust_catalog_stock(item["product_id"], item["quantity"])
         except requests.RequestException:
             pass  # stock restore is best-effort; cancellation still proceeds
 
-    now = datetime.datetime.utcnow().isoformat()
-    conn.execute("UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?", (now, order_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    conn.close()
     return jsonify(order_to_dict(row)), 200
 
 
@@ -280,7 +347,7 @@ def list_all_orders():
         return jsonify(error="admin role required"), 403
 
     conn = get_db()
-    rows = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+    rows = query_all(conn, "SELECT * FROM orders ORDER BY id DESC")
     conn.close()
     return jsonify([order_to_dict(r) for r in rows]), 200
 
@@ -296,16 +363,15 @@ def set_order_status(order_id):
         return jsonify(error=f"status must be one of {VALID_STATUSES}"), 400
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not row:
-        conn.close()
-        return jsonify(error="order not found"), 404
-
     now = datetime.datetime.utcnow().isoformat()
-    conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", (new_status, now, order_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    row = query_one(
+        conn,
+        "UPDATE orders SET status = %s, updated_at = %s WHERE id = %s RETURNING *",
+        (new_status, now, order_id),
+    )
     conn.close()
+    if not row:
+        return jsonify(error="order not found"), 404
     return jsonify(order_to_dict(row)), 200
 
 
