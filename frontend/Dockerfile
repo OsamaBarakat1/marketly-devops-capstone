@@ -22,6 +22,10 @@ ENV AUTH_SERVICE_HOST=auth-service \
     CATALOG_SERVICE_HOST=catalog-service \
     CATALOG_SERVICE_PORT=5002 \
     ORDERS_SERVICE_HOST=orders-service \
-    ORDERS_SERVICE_PORT=5003
+    ORDERS_SERVICE_PORT=5003 \
+    # Docker's embedded DNS server. Override with the cluster DNS address
+    # (kube-dns) if these proxy paths are ever used inside Kubernetes; there
+    # the Ingress routes /api itself, so they normally are not.
+    DNS_RESOLVER=127.0.0.11
 
 EXPOSE 80

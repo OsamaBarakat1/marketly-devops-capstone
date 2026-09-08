@@ -4,6 +4,16 @@
 # deployment (see k8s/ingress.yaml). Host/port are env-substituted at
 # container start (see Dockerfile ENV defaults) so the same image works
 # against docker-compose service names without a rebuild.
+
+# Nginx resolves a hostname written directly into proxy_pass exactly once,
+# when the config loads, and then caches that address for the life of the
+# process. Container addresses are not stable — recreating a backend gives it
+# a new one — so without this the proxy keeps dialling an address that has
+# moved, or worse, one that another service has since been given. Naming a
+# resolver and passing the upstream through a variable forces nginx to look
+# the name up again as it goes, honouring the TTL below.
+resolver ${DNS_RESOLVER} valid=10s ipv6=off;
+
 server {
     listen 80;
     server_name _;
@@ -11,8 +21,11 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # proxy_pass with a variable does not inherit the request URI the way a
+    # literal one does, so $request_uri is appended explicitly on each.
     location /api/auth {
-        proxy_pass http://${AUTH_SERVICE_HOST}:${AUTH_SERVICE_PORT};
+        set $auth_upstream "http://${AUTH_SERVICE_HOST}:${AUTH_SERVICE_PORT}";
+        proxy_pass $auth_upstream$request_uri;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -20,7 +33,8 @@ server {
     }
 
     location /api/products {
-        proxy_pass http://${CATALOG_SERVICE_HOST}:${CATALOG_SERVICE_PORT};
+        set $catalog_upstream "http://${CATALOG_SERVICE_HOST}:${CATALOG_SERVICE_PORT}";
+        proxy_pass $catalog_upstream$request_uri;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -28,7 +42,8 @@ server {
     }
 
     location /api/categories {
-        proxy_pass http://${CATALOG_SERVICE_HOST}:${CATALOG_SERVICE_PORT};
+        set $categories_upstream "http://${CATALOG_SERVICE_HOST}:${CATALOG_SERVICE_PORT}";
+        proxy_pass $categories_upstream$request_uri;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -36,7 +51,8 @@ server {
     }
 
     location /api/orders {
-        proxy_pass http://${ORDERS_SERVICE_HOST}:${ORDERS_SERVICE_PORT};
+        set $orders_upstream "http://${ORDERS_SERVICE_HOST}:${ORDERS_SERVICE_PORT}";
+        proxy_pass $orders_upstream$request_uri;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
