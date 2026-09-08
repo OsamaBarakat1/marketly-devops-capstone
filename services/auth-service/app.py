@@ -1,6 +1,6 @@
 """
 auth-service (Marketly)
-Owns its own SQLite database (users.db) — no other service may write to it.
+Owns the `auth` schema in PostgreSQL — no other service may write to it.
 
 Auth model:
   - Short-lived JWT *access token* (15 min), returned in the response body.
@@ -25,18 +25,33 @@ Listens on :5001
 """
 import os
 import re
-import sqlite3
+import time
 import secrets
 import hashlib
 import datetime
 
 import jwt
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-DB_PATH = os.environ.get("AUTH_DB_PATH", os.path.join(os.path.dirname(__file__), "users.db"))
+# No default: a connection string is environment-specific and embedding one
+# here would either hardcode an endpoint or commit a credential. Missing it
+# is a startup failure, not a fallback to some other database.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Each service owns a schema on the shared instance, so one service cannot
+# read or write another's tables even though they share a database.
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "auth")
+
+# Distinct per service: replicas of *this* service serialize their schema
+# creation against each other, without blocking the other services.
+INIT_LOCK_KEY = 4711001
+
 SHARED_SECRET = os.environ.get("SHARED_SECRET", "dev-shared-secret-change-me")
 
 ACCESS_TOKEN_EXP_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXP_MINUTES", "15"))
@@ -147,82 +162,123 @@ def cors_preflight(_unused):
 
 # --- DB ---
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def connect(autocommit=True):
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Point it at PostgreSQL, e.g. "
+            "postgresql://user:password@host:5432/marketly"
+        )
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        # Resolves unqualified table names to this service's schema on every
+        # connection, so no query needs to spell the schema out.
+        options=f"-c search_path={DB_SCHEMA}",
+        cursor_factory=RealDictCursor,
+    )
+    conn.autocommit = autocommit
     return conn
 
 
-def init_db():
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            email TEXT,
-            full_name TEXT,
-            address TEXT,
-            role TEXT NOT NULL DEFAULT 'customer',
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS refresh_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            token_hash TEXT UNIQUE NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            revoked_at TEXT
-        )
-        """
-    )
-    conn.commit()
+def get_db():
+    return connect()
 
-    existing = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (ADMIN_SEED_USERNAME,)
-    ).fetchone()
-    if not existing:
-        conn.execute(
-            """
-            INSERT INTO users (username, password_hash, email, full_name, address, role, created_at)
-            VALUES (?, ?, ?, ?, ?, 'admin', ?)
-            """,
-            (
-                ADMIN_SEED_USERNAME,
-                generate_password_hash(ADMIN_SEED_PASSWORD),
-                ADMIN_SEED_EMAIL,
-                "Store Admin",
-                "",
-                datetime.datetime.utcnow().isoformat(),
-            ),
-        )
-        conn.commit()
 
-    existing_demo = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (DEMO_SEED_USERNAME,)
-    ).fetchone()
-    if not existing_demo:
-        conn.execute(
-            """
-            INSERT INTO users (username, password_hash, email, full_name, address, role, created_at)
-            VALUES (?, ?, ?, ?, ?, 'customer', ?)
-            """,
-            (
-                DEMO_SEED_USERNAME,
-                generate_password_hash(DEMO_SEED_PASSWORD),
-                DEMO_SEED_EMAIL,
-                "Demo Customer",
-                "",
-                datetime.datetime.utcnow().isoformat(),
-            ),
-        )
-        conn.commit()
-    conn.close()
+def query_one(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchone()
+
+
+def query_all(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchall()
+
+
+def execute(conn, sql_text, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql_text, params)
+
+
+def init_db(max_wait_seconds=60):
+    """Creates the schema and seeds accounts, safely under concurrency.
+
+    Every replica runs this on startup, so it has to tolerate two things
+    a single-process SQLite app never faced: the database not being
+    reachable yet, and other replicas running the same statements at the
+    same moment.
+    """
+    deadline = time.monotonic() + max_wait_seconds
+    while True:
+        try:
+            conn = connect(autocommit=False)
+            break
+        except psycopg2.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Held until this transaction ends. Concurrent replicas queue
+                # here rather than racing to create the schema or double-seed
+                # the accounts below.
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (INIT_LOCK_KEY,))
+
+                cur.execute(
+                    sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                        sql.Identifier(DB_SCHEMA)
+                    )
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        email TEXT,
+                        full_name TEXT,
+                        address TEXT,
+                        role TEXT NOT NULL DEFAULT 'customer',
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS refresh_tokens (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        token_hash TEXT UNIQUE NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        revoked_at TEXT
+                    )
+                    """
+                )
+                # change-password revokes every token a user holds, which
+                # scans by user_id.
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS refresh_tokens_user_id_idx "
+                    "ON refresh_tokens (user_id)"
+                )
+
+                now = datetime.datetime.utcnow().isoformat()
+                for username, password, email, full_name, role in (
+                    (ADMIN_SEED_USERNAME, ADMIN_SEED_PASSWORD, ADMIN_SEED_EMAIL, "Store Admin", "admin"),
+                    (DEMO_SEED_USERNAME, DEMO_SEED_PASSWORD, DEMO_SEED_EMAIL, "Demo Customer", "customer"),
+                ):
+                    cur.execute(
+                        """
+                        INSERT INTO users (username, password_hash, email, full_name, address, role, created_at)
+                        VALUES (%s, %s, %s, %s, '', %s, %s)
+                        ON CONFLICT (username) DO NOTHING
+                        """,
+                        (username, generate_password_hash(password), email, full_name, role, now),
+                    )
+    finally:
+        conn.close()
 
 
 def user_to_dict(row):
@@ -259,29 +315,29 @@ def issue_refresh_token(conn, user_id):
     raw_token = secrets.token_urlsafe(48)
     now = datetime.datetime.utcnow()
     expires_at = now + datetime.timedelta(days=REFRESH_TOKEN_EXP_DAYS)
-    conn.execute(
-        "INSERT INTO refresh_tokens (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)",
+    execute(
+        conn,
+        "INSERT INTO refresh_tokens (user_id, token_hash, created_at, expires_at) VALUES (%s, %s, %s, %s)",
         (user_id, _hash_token(raw_token), now.isoformat(), expires_at.isoformat()),
     )
-    conn.commit()
     return raw_token, expires_at
 
 
 def revoke_refresh_token(conn, token_hash):
-    conn.execute(
-        "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+    execute(
+        conn,
+        "UPDATE refresh_tokens SET revoked_at = %s WHERE token_hash = %s AND revoked_at IS NULL",
         (datetime.datetime.utcnow().isoformat(), token_hash),
     )
-    conn.commit()
 
 
 def find_valid_refresh_token(conn, raw_token):
     if not raw_token:
         return None
     token_hash = _hash_token(raw_token)
-    row = conn.execute(
-        "SELECT * FROM refresh_tokens WHERE token_hash = ?", (token_hash,)
-    ).fetchone()
+    row = query_one(
+        conn, "SELECT * FROM refresh_tokens WHERE token_hash = %s", (token_hash,)
+    )
     if not row:
         return None
     if row["revoked_at"] is not None:
@@ -372,21 +428,23 @@ def register():
         return jsonify(error="validation failed", fields=errors), 400
 
     conn = get_db()
-    existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
-    if existing:
-        conn.close()
-        return jsonify(error="username already taken", fields={"username": "already taken"}), 409
-
     password_hash = generate_password_hash(password)
-    conn.execute(
+    # Let the unique constraint decide the winner: checking first and then
+    # inserting leaves a gap in which a concurrent request can claim the
+    # same username.
+    row = query_one(
+        conn,
         """
         INSERT INTO users (username, password_hash, email, full_name, address, role, created_at)
-        VALUES (?, ?, ?, ?, '', 'customer', ?)
+        VALUES (%s, %s, %s, %s, '', 'customer', %s)
+        ON CONFLICT (username) DO NOTHING
+        RETURNING *
         """,
         (username, password_hash, email, full_name, datetime.datetime.utcnow().isoformat()),
     )
-    conn.commit()
-    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify(error="username already taken", fields={"username": "already taken"}), 409
 
     raw_refresh, expires_at = issue_refresh_token(conn, row["id"])
     conn.close()
@@ -414,7 +472,7 @@ def login():
             )
 
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    user = query_one(conn, "SELECT * FROM users WHERE username = %s", (username,))
 
     if not user or not check_password_hash(user["password_hash"], password):
         conn.close()
@@ -443,7 +501,7 @@ def refresh():
         conn.close()
         return jsonify(error="missing or expired refresh token"), 401
 
-    user = conn.execute("SELECT * FROM users WHERE id = ?", (row["user_id"],)).fetchone()
+    user = query_one(conn, "SELECT * FROM users WHERE id = %s", (row["user_id"],))
     if not user:
         conn.close()
         return jsonify(error="user not found"), 404
@@ -482,7 +540,7 @@ def me():
         return jsonify(error="missing or invalid bearer token"), 401
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["uid"],)).fetchone()
+    row = query_one(conn, "SELECT * FROM users WHERE id = %s", (payload["uid"],))
     conn.close()
     if not row:
         return jsonify(error="user not found"), 404
@@ -504,23 +562,23 @@ def update_profile():
         return jsonify(error="validation failed", fields={"email": "email is not a valid address"}), 400
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["uid"],)).fetchone()
+    row = query_one(conn, "SELECT * FROM users WHERE id = %s", (payload["uid"],))
     if not row:
         conn.close()
         return jsonify(error="user not found"), 404
 
-    conn.execute(
+    row = query_one(
+        conn,
         """
         UPDATE users SET
-            email = COALESCE(?, email),
-            full_name = COALESCE(?, full_name),
-            address = COALESCE(?, address)
-        WHERE id = ?
+            email = COALESCE(%s, email),
+            full_name = COALESCE(%s, full_name),
+            address = COALESCE(%s, address)
+        WHERE id = %s
+        RETURNING *
         """,
         (email, full_name, address, payload["uid"]),
     )
-    conn.commit()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["uid"],)).fetchone()
     conn.close()
     return jsonify(user_to_dict(row)), 200
 
@@ -539,23 +597,23 @@ def change_password():
         return jsonify(error="validation failed", fields={"new_password": "must be at least 6 characters"}), 400
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["uid"],)).fetchone()
+    row = query_one(conn, "SELECT * FROM users WHERE id = %s", (payload["uid"],))
     if not row or not check_password_hash(row["password_hash"], current_password):
         conn.close()
         return jsonify(error="current password is incorrect"), 401
 
-    conn.execute(
-        "UPDATE users SET password_hash = ? WHERE id = ?",
+    execute(
+        conn,
+        "UPDATE users SET password_hash = %s WHERE id = %s",
         (generate_password_hash(new_password), payload["uid"]),
     )
-    conn.commit()
     # Changing the password invalidates all existing refresh tokens for this
     # user — a stolen-but-not-yet-used refresh token becomes worthless too.
-    conn.execute(
-        "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+    execute(
+        conn,
+        "UPDATE refresh_tokens SET revoked_at = %s WHERE user_id = %s AND revoked_at IS NULL",
         (datetime.datetime.utcnow().isoformat(), payload["uid"]),
     )
-    conn.commit()
     conn.close()
     return jsonify(message="password updated"), 200
 

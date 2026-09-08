@@ -27,6 +27,7 @@ services:
   auth-service:
     build: ./services/auth-service
     environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketly}:${POSTGRES_PASSWORD:-marketly_dev_password}@postgres:5432/${POSTGRES_DB:-marketly}
       # auth, catalog, and orders must share one value or the JWTs that
       # auth issues fail verification in the other two.
       SHARED_SECRET: ${SHARED_SECRET:-dev-shared-secret-change-me}
@@ -46,6 +47,7 @@ services:
   catalog-service:
     build: ./services/catalog-service
     environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketly}:${POSTGRES_PASSWORD:-marketly_dev_password}@postgres:5432/${POSTGRES_DB:-marketly}
       SHARED_SECRET: ${SHARED_SECRET:-dev-shared-secret-change-me}
     ports:
       - "5002:5002"
@@ -62,6 +64,7 @@ services:
   orders-service:
     build: ./services/orders-service
     environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketly}:${POSTGRES_PASSWORD:-marketly_dev_password}@postgres:5432/${POSTGRES_DB:-marketly}
       SHARED_SECRET: ${SHARED_SECRET:-dev-shared-secret-change-me}
       # Priced and stock-checked against catalog-service over the compose
       # network, never against values sent by the client.

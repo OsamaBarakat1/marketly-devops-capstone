@@ -32,6 +32,9 @@ Listens on `http://localhost:5003`. Requires catalog-service reachable at
 
 ## Environment variables
 
-- `ORDERS_DB_PATH` — path to SQLite file (default: `orders.db` next to app.py)
+- `DATABASE_URL` — **required**, PostgreSQL connection string
+  (`postgresql://user:password@host:5432/marketly`). No default: the service
+  fails to start rather than silently using some other database.
+- `DB_SCHEMA` — schema this service owns (default `orders`).
 - `SHARED_SECRET` — **must match auth-service's `SHARED_SECRET`**
 - `CATALOG_SERVICE_URL` — base URL of catalog-service (default `http://localhost:5002`)

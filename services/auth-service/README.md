@@ -78,7 +78,14 @@ network call.
 
 ## Environment variables
 
-- `AUTH_DB_PATH` — path to SQLite file (default: `users.db` next to app.py)
+- `DATABASE_URL` — **required**, PostgreSQL connection string
+  (`postgresql://user:password@host:5432/marketly`). There is deliberately no
+  default: the service fails to start rather than silently using some other
+  database. `docker compose` supplies it locally; Kubernetes supplies it from
+  a Secret.
+- `DB_SCHEMA` — schema this service owns (default `auth`). Each service owns
+  its own schema on the shared instance, so no service can read or write
+  another's tables.
 - `SHARED_SECRET` — JWT signing secret for access tokens. **Must be the
   same value** on catalog-service and orders-service since they verify
   tokens without calling auth-service.
