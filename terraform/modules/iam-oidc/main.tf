@@ -45,17 +45,34 @@ data "aws_iam_policy_document" "assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # The condition that actually matters. `sub` encodes which repository and
-    # which ref the run belongs to. Restricting it to this repo's chosen
-    # branch means a fork, a pull request from a fork, or any other
-    # repository on GitHub gets its token rejected. Omitting it, or using a
-    # bare wildcard, would let any repository on GitHub assume this role.
+    # The condition that actually matters. `sub` encodes which repository the
+    # run belongs to and what kind of run it is. Every entry below is scoped
+    # to this one repository, so a fork or any other repository on GitHub
+    # gets its token rejected. Omitting this condition, or using a bare
+    # wildcard, would let any repository on GitHub assume this role.
+    #
+    # One entry per way a workflow legitimately reaches AWS:
+    #
+    #   ref:refs/heads/<branch>  ci.yml publishing images, and terraform.yml
+    #                            applying, on a push to that branch
+    #   environment:*            any job that names an environment, which is
+    #                            how terraform.yml's apply job runs
+    #   pull_request             terraform.yml's plan job. Without this, plan
+    #                            on a pull request fails at the credentials
+    #                            step: GitHub issues that run a token whose
+    #                            sub is "repo:<repo>:pull_request", which
+    #                            matches neither of the patterns above.
+    #
+    # The pull_request entry does not reopen the fork problem. GitHub refuses
+    # to issue an id-token to a workflow triggered by a pull request from a
+    # fork, so such a run has no token to present here at all.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
         "repo:${var.github_repo}:ref:refs/heads/${var.deploy_branch}",
         "repo:${var.github_repo}:environment:*",
+        "repo:${var.github_repo}:pull_request",
       ]
     }
   }

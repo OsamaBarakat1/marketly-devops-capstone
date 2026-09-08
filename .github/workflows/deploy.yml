@@ -32,12 +32,22 @@ concurrency:
 jobs:
   deploy:
     name: Roll out to k3s
+    # AWS_ROLE_ARN is checked as well as ENABLE_CD because it is what gates
+    # ci.yml's publish job. Without it, CI still runs its integration test and
+    # still reports success, having pushed no images at all — and this job
+    # would then roll out a tag ECR does not have.
     if: >-
       vars.ENABLE_CD == 'true' &&
+      vars.AWS_ROLE_ARN != '' &&
       (github.event_name == 'workflow_dispatch' ||
        github.event.workflow_run.conclusion == 'success')
     runs-on: self-hosted
-    timeout-minutes: 20
+    # Has to exceed what the scripts allow themselves: deploy.sh waits up to
+    # 5m on each of four rollouts, and healthcheck.sh --wait 120 adds two
+    # minutes more. At 20 a slow but succeeding rollout is cancelled — and a
+    # cancellation is not a failure, so the diagnostics step below would not
+    # run either, losing exactly the output needed to explain it.
+    timeout-minutes: 30
 
     env:
       NAMESPACE: marketly
