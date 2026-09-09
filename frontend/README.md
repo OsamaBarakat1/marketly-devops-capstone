@@ -7,9 +7,9 @@ area for managing products and order statuses. Talks to the three backend
 microservices through a same-origin Vite dev proxy — no server-side
 rendering, no backend-for-frontend layer.
 
-This app is fully built — there is no remaining frontend work for students.
-The infrastructure to deploy it (Docker, Kubernetes, Terraform, CI/CD) is the
-actual assignment; see the root `README.md` and `PROJECT_BRIEF.md`.
+The application code was the starting point for this project; the
+infrastructure that builds, ships and runs it — Docker, Kubernetes, Terraform,
+CI/CD — is the work. See the root [`README.md`](../README.md).
 
 ## Auth model (what's different from a typical capstone)
 
@@ -54,8 +54,8 @@ Kubernetes Ingress will do in front of the real deployment.
 
 When deploying behind a Kubernetes Ingress, the Ingress takes over this
 path-based routing and these dev-proxy targets are no longer used — that
-wiring is part of the infrastructure assignment, not something this app
-needs to know about.
+wiring lives in `k8s/ingress.yaml`, not in anything this app needs to know
+about.
 
 ## Structure
 
@@ -93,6 +93,5 @@ scratch using common, non-proprietary UI patterns.
 npm run build
 ```
 
-Outputs static files to `dist/` — this is what the frontend Dockerfile
-(currently empty, a student task) should build and serve, typically via
-Nginx.
+Outputs static files to `dist/` — this is what the frontend `Dockerfile`
+builds in its Node stage and hands to an Nginx stage to serve.

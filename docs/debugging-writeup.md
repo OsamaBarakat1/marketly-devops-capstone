@@ -1,7 +1,7 @@
 # One thing that broke: the catalog page 502'd, intermittently
 
 Required by the submission checklist in
-[`PROJECT_BRIEF.md`](../PROJECT_BRIEF.md) §7. Fixed in commit
+[`PROJECT_BRIEF.md`](./assignment/PROJECT_BRIEF.md) §7. Fixed in commit
 `Re-resolve backend addresses in the frontend proxy`.
 
 ## The symptom
