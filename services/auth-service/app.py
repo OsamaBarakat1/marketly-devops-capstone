@@ -17,7 +17,7 @@ Auth model:
     /refresh and /logout endpoints from cross-site request forgery via the
     standard double-submit pattern.
 
-Run standalone:
+Run standalone (development server; containers run gunicorn instead):
     python -m venv venv && source venv/bin/activate
     pip install -r requirements.txt
     python app.py
@@ -77,8 +77,11 @@ DEMO_SEED_USERNAME = os.environ.get("DEMO_SEED_USERNAME", "demo")
 DEMO_SEED_PASSWORD = os.environ.get("DEMO_SEED_PASSWORD", "demo1234")
 DEMO_SEED_EMAIL = os.environ.get("DEMO_SEED_EMAIL", "demo@example.com")
 
-# --- Rate limiting / account lockout (in-memory; fine for a single process) ---
-# Per the project's scope, this is intentionally dependency-free (no Redis).
+# --- Rate limiting / account lockout (in-memory, per process) ---
+# Intentionally dependency-free (no Redis), which is why the Dockerfile runs
+# gunicorn with a single threaded worker: a second worker would keep its own
+# copy of these dicts and double every threshold below. Counters are still
+# per-pod, so the effective limit scales with the replica count.
 LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "5"))
 LOGIN_LOCKOUT_MINUTES = int(os.environ.get("LOGIN_LOCKOUT_MINUTES", "15"))
 LOGIN_ATTEMPT_WINDOW_MINUTES = int(os.environ.get("LOGIN_ATTEMPT_WINDOW_MINUTES", "15"))
@@ -618,6 +621,12 @@ def change_password():
     return jsonify(message="password updated"), 200
 
 
+# gunicorn imports this module rather than executing it, so the schema
+# bootstrap cannot live in the __main__ block below. With --preload (see the
+# Dockerfile) it runs once in the gunicorn master, before any worker forks.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
+    # Local development only. Containers are served by gunicorn: Flask's
+    # built-in server is single-threaded and explicitly not for production.
     app.run(host="0.0.0.0", port=5001)

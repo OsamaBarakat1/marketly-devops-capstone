@@ -9,7 +9,7 @@ SHARED_SECRET auth-service signs with, so no network call back to
 auth-service is needed. The stock-adjustment endpoint is called internally
 by orders-service whenever an order is placed or cancelled.
 
-Run standalone:
+Run standalone (development server; containers run gunicorn instead):
     python -m venv venv && source venv/bin/activate
     pip install -r requirements.txt
     python app.py
@@ -380,6 +380,12 @@ def adjust_stock(product_id):
     return jsonify(row_to_dict(row)), 200
 
 
+# gunicorn imports this module rather than executing it, so the schema
+# bootstrap cannot live in the __main__ block below. With --preload (see the
+# Dockerfile) it runs once in the gunicorn master, before any worker forks.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
+    # Local development only. Containers are served by gunicorn: Flask's
+    # built-in server is single-threaded and explicitly not for production.
     app.run(host="0.0.0.0", port=5002)
